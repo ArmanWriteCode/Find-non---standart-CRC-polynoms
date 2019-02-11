@@ -1,0 +1,370 @@
+#pragma once
+#include <string>
+#include <omp.h>
+#include <stdint.h>
+#include <vector>
+#include <unistd.h>
+typedef unsigned char byte;
+#define BITMASK(X) ((uint64_t)0x01 << (X))
+#define MASK32 0xFFFFFFFF
+#define N_ALG 48
+class crc{
+private:
+    std::string cm_name; /* Название алгоритма */
+    int cm_width; /* Степень полинома в битах [8,32]. */
+    uint64_t cm_poly; /* Полином алгоритма */
+    uint64_t cm_init; /* Начальное значение регистра */
+    bool cm_refin; /* Обращать байты на входе? */
+    bool cm_refot; /* Обращать конечное значение CRC? */
+    uint64_t cm_xorot; /* Комбинируется по XOR с конечным значением CRC. */
+    uint64_t cm_reg; /* Контекст времени исполнения. */
+    //uint64_t cm_check; /* Значение CRC для строки «123456789» */
+    /* Функция возвращает значение v с обращенными b [0,32] младшими бит. */
+    /* Например: reflect(0x3e23L,3) == 0x3e26 */
+    inline uint64_t reflect (uint64_t v, int b){
+        int i;
+        uint64_t t = v;
+        for (i=0; i<b; i++)
+        {
+            if (t & 1L)
+                v|= BITMASK((b-1)-i);
+            else
+                v&= ~BITMASK((b-1)-i);
+            t>>=1;
+        }
+        return v;
+    }
+    /* Возвращает длинное слово, чье значение равно (2^p_cm->cm_width)-1. .*/
+    /* Этот сделано для улучшения переносимости пакета (чтобы обойтись без <<32). */
+    inline uint64_t widmask (){
+        return (((1L<<(this->cm_width-1))-1L)<<1)|1L;
+    }
+public:
+    /* Конструктор класса */
+    crc (std::string name, int width, uint64_t poly, uint64_t init, bool refin, bool refot, uint64_t xorot){
+        this->cm_name = name;
+        this->cm_width = width;
+        this->cm_poly = poly;
+        this->cm_init = init;
+        this->cm_refin = refin;
+        this->cm_refot = refot;
+        this->cm_xorot = xorot;
+        this->cm_reg = init;
+    }
+    crc (){}
+    /*Возвращает число байт контрольной суммы*/
+    int nByteCRC(){
+        return (this->cm_width>>3);
+    }
+    /* Вывод параметров алгоритма на экран */
+    void showCRC(){
+        printf("\n-------------------------");
+        printf("\nName:\t%s", this->cm_name.c_str());
+        printf("\nWidth:\t%d", this->cm_width);
+        printf("\nPoly:\t0x%lX", this->cm_poly);
+        printf("\nInit:\t0x%lX", this->cm_init);
+        if(this->cm_refin)
+            printf("\nRefIn:\ttrue");
+        else
+            printf("\nRefIn:\tfalse");
+        if(this->cm_refot)
+            printf("\nRefOut:\ttrue");
+        else
+            printf("\nRefOut:\tfalse");
+        printf("\nXorOut:\t0x%lX\n", this->cm_xorot);
+        printf("-------------------------\n");
+    }
+    /* Определение алгоритма (задание параметров) */
+    void initCRC (std::string name, int width, uint64_t poly, uint64_t init, bool refin, bool refot, uint64_t xorot){
+        this->cm_name = name;
+        this->cm_width = width;
+        this->cm_poly = poly;
+        this->cm_init = init;
+        this->cm_refin = refin;
+        this->cm_refot = refot;
+        this->cm_xorot = xorot;
+        this->cm_reg = init;
+    }
+    /* Обработка единичного байта сообщения [0,255]. */
+    void nxtCRC (int ch){
+        int i;
+        uint64_t uch = (uint64_t) ch;
+        uint64_t topbit = BITMASK(this->cm_width-1);
+        if (this->cm_refin) uch = reflect(uch,8);
+        this->cm_reg ^= (uch << (this->cm_width-8));
+        for (i=0; i<8; i++)
+        {
+            if (this->cm_reg & topbit)
+                this->cm_reg = (this->cm_reg << 1) ^ this->cm_poly;
+            else
+                this->cm_reg <<= 1;
+            this->cm_reg &= widmask();
+        }
+    }
+    /* Обработка блока байтов сообщения. */
+    void blkCRC (byte *blk_adr, uint64_t blk_len){
+        while (blk_len--) nxtCRC(*blk_adr++);
+    }
+    /* Вывод величины CRC, вычисленной к настоящему моменту. */
+    uint64_t returnCRC (){
+        if (this->cm_refot)
+            return this->cm_xorot ^ reflect(this->cm_reg, this->cm_width);
+        else
+            return this->cm_xorot ^ this->cm_reg;
+    }
+    /* Следующая функция может быть использована для расчета таблицы CRC */
+    /* как во время исполнения, так и для создания статических таблиц. */
+    uint64_t tabCRC (int index){
+        int i;
+        uint64_t r;
+        uint64_t topbit = BITMASK(this->cm_width-1);
+        uint64_t inbyte = (uint64_t) index;
+        if (this->cm_refin) inbyte = reflect(inbyte,8);
+        r = inbyte << (this->cm_width-8);
+        for (i=0; i<8; i++)
+            if (r & topbit)
+                r = (r << 1) ^ this->cm_poly;
+            else
+                r<<=1;
+        if (this->cm_refin) r = reflect(r,this->cm_width);
+        return r & this->widmask();
+    }
+    /* Возвращает объект по порядковому номеру */
+    static crc algCRC(int index){
+        if(index > (N_ALG - 1) || index < 0){
+            printf("\n---------- Algorithm does not exist! ----------\n");
+            crc out("NAME", 0, 0x0, 0x0, false, false, 0x0);
+            return out;
+        }
+        crc mass[N_ALG];
+        mass[0].initCRC("CRC-8", 8, 0x7, 0x0, false, false, 0x0);
+        mass[1].initCRC("CRC-8/CDMA2000", 8, 0x9B, 0xFF, false, false, 0x0);
+        mass[2].initCRC("CRC-8/DARC", 8, 0x39, 0x0, true, true, 0x0);
+        mass[3].initCRC("CRC-8/DVB-S2", 8, 0xD5, 0x0, false, false, 0x0);
+        mass[4].initCRC("CRC-8/EBU", 8, 0x1D, 0xFF, true, true, 0x0);
+        mass[5].initCRC("CRC-8/I-CODE", 8, 0x1D, 0xFD, false, false, 0x0);
+        mass[6].initCRC("CRC-8/ITU", 8, 0x7, 0x0, false, false, 0x55);
+        mass[7].initCRC("CRC-8/MAXIM", 8, 0x31, 0x0, true, true, 0x0);
+        mass[8].initCRC("CRC-8/ROHC", 8, 0x7, 0xFF, true, true, 0x0);
+        mass[9].initCRC("CRC-8/WCDMA", 8, 0x9B, 0x0, true, true, 0x0);
+        mass[10].initCRC("CRC-8/SAE", 8, 0x1D, 0xFF, false, false, 0xFF);
+        mass[11].initCRC("CRC-8/H2F", 8, 0x2F, 0xFF, false, false, 0xFF);
+        mass[12].initCRC("CRC-16/ARC", 16, 0x8005, 0x0, true, true, 0x0);
+        mass[13].initCRC("CRC-16/AUG-CCITT", 16, 0x1021, 0x1D0F, false, false, 0x0);
+        mass[14].initCRC("CRC-16/BUYPASS", 16, 0x8005, 0x0, false, false, 0x0);
+        mass[15].initCRC("CRC-16/CCITT-FALSE", 16, 0x1021, 0xFFFF, false, false, 0x0);
+        mass[16].initCRC("CRC-16/CDMA2000", 16, 0xC867, 0xFFFF, false, false, 0x0);
+        mass[17].initCRC("CRC-16/DDS-110", 16, 0x8005, 0x800D, false, false, 0x0);
+        mass[18].initCRC("CRC-16/DECT-R", 16, 0x589, 0x0, false, false, 0x1);
+        mass[19].initCRC("CRC-16/DECT-X", 16, 0x589, 0x0, false, false, 0x0);
+        mass[20].initCRC("CRC-16/DNP", 16, 0x3D65, 0x0, true, true, 0xFFFF);
+        mass[21].initCRC("CRC-16/EN-13757", 16, 0x3D65, 0x0, false, false, 0xFFFF);
+        mass[22].initCRC("CRC-16/GENIBUS", 16, 0x1021, 0xFFFF, false, false, 0xFFFF);
+        mass[23].initCRC("CRC-16/MAXIM", 16, 0x8005, 0x0, true, true, 0xFFFF);
+        mass[24].initCRC("CRC-16/MCRF4XX", 16, 0x1021, 0xFFFF, true, true, 0x0);
+        mass[25].initCRC("CRC-16/RIELLO", 16, 0x1021, 0xB2AA, true, true, 0x0);
+        mass[26].initCRC("CRC-16/T10-DIF", 16, 0x8BB7, 0x0, false, false, 0x0);
+        mass[27].initCRC("CRC-16/TELEDISK", 16, 0xA097, 0x0, false, false, 0x0);
+        mass[28].initCRC("CRC-16/TMS37157", 16, 0x1021, 0x89EC, true, true, 0x0);
+        mass[29].initCRC("CRC-16/USB", 16, 0x8005, 0xFFFF, true, true, 0xFFFF);
+        mass[30].initCRC("CRC-A", 16, 0x1021, 0xC6C6, true, true, 0x0);
+        mass[31].initCRC("CRC-16/KERMIT", 16, 0x1021, 0x0, true, true, 0x0);
+        mass[32].initCRC("CRC-16/MODBUS", 16, 0x8005, 0xFFFF, true, true, 0x0);
+        mass[33].initCRC("CRC-16/X-25", 16, 0x1021, 0xFFFF, true, true, 0xFFFF);
+        mass[34].initCRC("CRC-16/XMODEM", 16, 0x1021, 0x0, false, false, 0x0);
+        mass[35].initCRC("CRC-24", 24, 0x864CFB, 0xB704CE, false, false, 0x0);
+        mass[36].initCRC("CRC-24/FLEXRAY-A", 24, 0x5D6DCB, 0xFEDCBA, false, false, 0x0);
+        mass[37].initCRC("CRC-24/FLEXRAY-B", 24, 0x5D6DCB, 0xABCDEF, false, false, 0x0);
+        mass[38].initCRC("CRC-32", 32, 0x4C11DB7, 0xFFFFFFFF, true, true, 0xFFFFFFFF);
+        mass[39].initCRC("CRC-32/BZIP2", 32, 0x4C11DB7, 0xFFFFFFFF, false, false, 0xFFFFFFFF);
+        mass[40].initCRC("CRC-32C", 32, 0x1EDC6F41, 0xFFFFFFFF, true, true, 0xFFFFFFFF);
+        mass[41].initCRC("CRC-32D", 32, 0xA833982B, 0xFFFFFFFF, true, true, 0xFFFFFFFF);
+        mass[42].initCRC("CRC-32/MPEG-2", 32, 0x4C11DB7, 0xFFFFFFFF, false, false, 0x0);
+        mass[43].initCRC("CRC-32/POSIX", 32, 0x4C11DB7, 0x0, false, false, 0xFFFFFFFF);
+        mass[44].initCRC("CRC-32Q", 32, 0x814141AB, 0x0, false, false, 0x0);
+        mass[45].initCRC("CRC-32/JAMCRC", 32, 0x4C11DB7, 0xFFFFFFFF, true, true, 0x0);
+        mass[46].initCRC("CRC-32/XFER", 32, 0xAF, 0x0, false, false, 0x0);
+        mass[47].initCRC("CRC-32", 32, 0xF4ACFB13, 0xFFFFFFFF, true, true, 0xFFFFFFFF);
+        return mass[index];
+    }
+    /* Определяет правильность контрольной суммы, */
+    /* посчитанной по заданному стандартному алгоритму */
+    static bool checkCRC(byte *msg, int msg_len, int index){
+        if(index == N_ALG){//Check SUM algorithm
+            byte temp = 0x0;
+            for(int i = 0; i < msg_len-1; i++){
+                temp += msg[i];
+            }
+            if(temp == msg[msg_len-1]){
+                printf("\n---------- SUM ----------\n");
+                return true;
+            }
+            else if(256-temp == msg[msg_len-1])
+            {
+                printf("\n---------- NSUM ---------");
+                return true;
+            }
+        }
+        else if(index == N_ALG + 1){//Check XOR algorithm
+            byte temp = 0x0;
+            for(int i = 0; i < msg_len-1; i++){
+                temp ^= msg[i];
+            }
+            if(temp == msg[msg_len-1]){
+                printf("\n---------- XOR ----------");
+                return true;
+            }
+        }
+        else if((index >= 0)&&(index < N_ALG)){//Check CRC algorithm
+            crc alg;
+            alg = algCRC(index);
+            int byte_crc = alg.nByteCRC();
+            alg.blkCRC(msg, msg_len - byte_crc);
+            unsigned int temp = 0x00;//контрольная сумма пакета
+            for(int i = 0; i < byte_crc; i++){
+                temp <<= 8;
+                temp |= msg[msg_len - byte_crc + i];
+            }
+            if(alg.returnCRC() == temp){
+                printf("\n---------- CRC ----------");
+                alg.showCRC();
+                return true;
+            }
+        }
+        return false;
+    }
+    /* Определяет правильность контрольной суммы, */
+    /* посчитанной по заданному стандартному алгоритму */
+    static bool checkCRC(byte *msg, int msg_len, crc alg){
+        int byte_crc = alg.nByteCRC();
+        alg.blkCRC(msg, msg_len - byte_crc);
+        //unsigned int temp = 0x00;//контрольная сумма пакета
+        /*for(int i = 0; i < byte_crc; i++){
+            temp <<= 8;
+            temp |= msg[msg_len - byte_crc + i];
+        }*/
+        if(alg.returnCRC() == 0x9FF0CD7B){
+            printf("\n---------- CRC ----------");
+            alg.showCRC();
+            return true;
+        }
+        return false;
+    }
+    /* Ищет алгоритм контрольной суммы входного сообщения с CRC */
+    /* из списка в algCRC (наиболее популярные) */
+    static void searchStdCRC(byte *msg, int msg_len){
+        for(int i = 0; i <= N_ALG + 1; i++){
+            checkCRC(&msg[0], msg_len, i);
+        }
+    }
+    int inverse_crc_bytes(byte *msg, int msg_len, int width){
+        if((width & 0x07) != 0x00) return -1; // is no multiple to 8 (byte)
+        std::vector<byte> crc_bytes;
+        for(uint8_t i = 1; i < (width/8+1); i++)
+            crc_bytes.push_back(msg[msg_len - i]);
+        for(uint8_t i = (width/8); i > 0; i--)
+            msg[msg_len - i] = crc_bytes[crc_bytes.size() - i];
+        return 1;
+    }
+    int inverse_crc_bit_quads(byte *msg, int msg_len, int width){
+        if((width & 0x07) != 0x00) return -1; // is no multiple to 8 (byte)
+        for (uint32_t i = msg_len - 1; i > (msg_len - width/8 - 1); i--)
+        {
+            uint8_t temp = msg[i] << 4;
+            msg[i] = msg[i] >> 4;
+            msg[i] = msg[i] ^ temp;
+        }
+        inverse_crc_bytes(msg, msg_len, width);
+        return 1;
+    }
+    /* Ищет алгоритм контрольной суммы входного сообщения с CRC */
+    /* для заданной длины полинома (произвольного) */
+    static void searchCRC(byte *msg, int msg_len, byte *msg1, int msg_len1, int width){
+        if((width & 0x07) != 0x00) return; // is no multiple to 8 (byte)
+        crc alg;
+        //uint64_t poly = 0x01; // only odd
+        //uint64_t init = 0x00;//BITMASK(width) - 0x01;
+        bool refin = false;
+        bool refot = false;
+        bool inv_byte_out = false;
+        uint64_t xorot = 0x00;
+        //        std::vector<uint64_t> poly_mas = {0x04C11DB7, 0x1EDC6F41, 0xA833982B, 0x814141AB, 0x000000AF};
+        //        const uint64_t mask = BITMASK(width) - 0x01;
+        int firstCircle = true;
+        uint64_t mask = BITMASK(width) - 0x01;
+        for(; init <= mask; init +=mask){
+            //if (firstCircle) { init += mask;}
+            //std::cout << std::hex << "xorot: " << xorot << "\tinit: " << init << std::endl;
+            for(; xorot <= mask; xorot +=mask){
+                //if (firstCircle) { xorot += mask;}
+                for(int refi = 0; refi < 2; refi++){
+                    //if (firstCircle) { refi = 1; refin = !refin;}
+                    for(int refo = 0; refo < 2; refo++){
+                        //if (firstCircle) { refo = 1; refot = !refot;}
+                        for(int invbyte = 0; invbyte < 2; invbyte++){
+
+                            /*if (firstCircle) {
+                                invbyte = 1;
+                                inv_byte_out = !inv_byte_out;
+                                alg.inverse_crc_bytes(msg, msg_len, width);
+                                alg1.inverse_crc_bytes(msg1, msg_len1, width);
+                            }*/
+                            //firstCircle = false;
+                            std::cout.width(15);
+                            std::cout << std::hex << "init: " << init << "\txorot: "
+                                      << xorot << "\trefin: " << refin << "\trefout: "
+                                      << refot << "\tinverse_out_bytes: " << inv_byte_out
+                                      << std::endl;
+
+//                            omp_set_num_threads(1);
+#pragma omp parallel shared(msg, msg_len, mask, width, init, refin, refot, xorot)
+                            {
+                                /*для первого блока*/
+
+                                crc alg_crc;
+                                //crc alg_crc1;
+                                int msg_len_s = msg_len;
+
+
+                                uint64_t mask_s = mask;
+                                int width_s = width;
+                                uint64_t init_s = init;
+                                bool refin_s = refin;
+                                bool refot_s = refot;
+                                uint64_t xorot_s = xorot;
+
+                                byte *msg_shared = new byte[msg_len_s];
+
+
+                                memcpy(msg_shared,msg,msg_len_s);
+                                memcpy(msg_shared1,msg1,msg_len_s1);
+
+                                #pragma omp for
+                                for(uint64_t poly = 0x01; poly <= mask_s; poly += 2){
+
+                                    alg_crc.initCRC("-", width_s, poly, init_s, refin_s, refot_s, xorot_s);
+                                    //alg_crc1.initCRC("-", width_s, poly, init_s, refin_s, refot_s, xorot_s);
+                                    checkCRC(msg_shared, msg_len_s, alg_crc);
+
+                                        }
+                                    }
+                                } // poly
+                                delete [] msg_shared;
+                                delete [] msg_shared1;
+                            }
+                            //poly = 0x01;
+                            inv_byte_out = !inv_byte_out;
+                            //alg.inverse_crc_bytes(msg, msg_len, width);
+                            //alg1.inverse_crc_bytes(msg1, msg_len1, width);
+                        }
+                        refot = !refot;
+                    }
+                    refin = !refin;
+                } //refs
+            } // xorot
+            xorot = 0x00;
+
+        } // init
+    }
+};
+
